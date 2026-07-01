@@ -1,0 +1,591 @@
+---
+title: "test_code_03032026" 
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Generate Random DAG and the data
+
+```{r}
+# Copula (from Cui code)
+source('gaussCItestLocal.R')
+source('inferCopulaModel.R')
+source("latent_pc.R")
+source("utility.R")
+source("functions_2026april21.R")
+
+library(pcalg)
+library(mvtnorm)
+library(dplyr)
+library(future.apply)
+library(ggplot2)
+library(gtsummary)
+library(ggpubr)
+library(stringr)
+library(igraph)
+
+```
+
+## Read in summary/dag data and collapse
+
+```{r}
+# in case you need to read them in after the combining step
+results <- read.csv('/Users/user/Desktop/mixed_data_simulation/r scripts/results/simulation_results_060226.csv') %>%
+  # filter(! p == 200 )  %>%
+  # filter(!method == 6) %>%
+  filter(TPR + FPR + adj_prec + adj_rec + arr_prec + arr_rec != 0) %>% 
+  mutate(method_named = case_when(
+    method == 1 ~ "Oracle PC",
+    method == 2 ~ "Gaussian PC",
+    method == 3 ~ "FGES (DG)",
+    # method == 4 ~ "FGES (CG)",
+    method == 4 ~ "Copula PC",
+    method == 5 ~ "Latent PC",
+    method == 6 ~ "DAGSLAM"),
+    p = as.factor(p))
+
+ # missing_check <- results %>% 
+ #    group_by(p, deg, alpha, method) %>% 
+ #    summarise(completed_seeds = n(), .groups = 'drop') %>% 
+ #    filter(completed_seeds < 50)
+ # 
+ # print(missing_check)
+
+# check_0s <- results
+
+results_summary <- results  %>%
+  group_by(method, alpha, deg, n, p) %>%
+  summarize(
+    across(
+      .cols = c(time_secs, corr_diff, TPR, FPR, adj_prec, adj_rec, arr_prec, arr_rec, SHD), 
+      .fns = list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)),
+      .names = "{.fn}_{.col}"
+    ),
+    .groups = "drop")   %>% 
+  mutate(method_named = case_when(
+    method == 1 ~ "Oracle PC",
+    method == 2 ~ "Gaussian PC",
+    method == 3 ~ "FGES (DG)",
+    # method == 4 ~ "FGES (CG)",
+    method == 4 ~ "Copula PC",
+    method == 5 ~ "Latent PC",
+    method == 6 ~ "DAGSLAM"),
+    p = as.factor(p))
+# 
+# ## dags
+dag_list <- readRDS('/Users/user/Desktop/mixed_data_simulation/r scripts/results/all_dags_combined_run_May30_redo.rds')
+
+# convert the list into a basic dataframe
+dag_df <- tibble(
+  filename = names(dag_list),
+  matrix_data = unname(dag_list)
+)
+
+# split the dataframe into True DAGs and Estimated DAGs
+true_dags <- dag_df %>%
+  filter(str_detect(filename, "true_dag")) %>%
+  mutate(
+    seed = as.numeric(str_extract(filename, "(?<=seed)\\d+")),
+    n = as.numeric(str_extract(filename, "(?<=_n)\\d+")),
+    p = as.numeric(str_extract(filename, "(?<=_p)\\d+")),
+    deg = as.numeric(str_extract(filename, "(?<=_deg)\\d+"))
+  ) %>%
+  rename(true_dag = matrix_data) %>%
+  select(-filename)
+
+est_dags <- dag_df %>%
+  filter(str_detect(filename, "disc_mat")) %>%
+  mutate(
+    seed = as.numeric(str_extract(filename, "(?<=seed)\\d+")),
+    alpha = as.numeric(str_extract(filename, "(?<=alpha)[0-9.]+")),
+    n = as.numeric(str_extract(filename, "(?<=_n)\\d+")),
+    p = as.numeric(str_extract(filename, "(?<=_p)\\d+")),
+    deg = as.numeric(str_extract(filename, "(?<=_deg)\\d+")),
+    method = as.numeric(str_extract(filename, "(?<=method)\\d+"))
+  ) %>%
+  rename(est_dag = matrix_data) %>%
+  select(-filename)
+
+# join them together
+final_dag_database <- est_dags %>%
+  left_join(true_dags, by = c("seed", "n", "p", "deg"))
+
+```
+
+\
+\
+
+```{r}
+plot_clean_dag <- function(adj_matrix, plot_title = "Causal Graph", metrics_text = NA, node_color = "lightblue", master_coords = NULL) {
+  
+  g <- graph_from_adjacency_matrix(adj_matrix, mode = "directed")
+  
+ # 1. Find and keep only connected nodes
+  V(g)$name <- 1:vcount(g)
+  keep_nodes <- igraph::degree(g) > 0 
+  g_clean <- delete_vertices(g, which(!keep_nodes))
+  
+  # 2. FIX: Apply arrow logic to g_clean, NOT g!
+  mutual_edges <- which_mutual(g_clean)
+  E(g_clean)$arrow.mode <- ifelse(mutual_edges, 0, 2) # 0 = flat line, 2 = forward arrow
+  
+  # 3. Plot
+  plot(g_clean, 
+       main = plot_title, 
+       vertex.size = 10,          
+       vertex.color = node_color,
+       vertex.label.cex = 0.8,    
+       edge.arrow.size = 0.4,     # Keeps the arrows nice and thin!
+       layout = layout_with_sugiyama,
+       margin = 0,
+       asp = 0)
+  
+  if (!is.na(metrics_text)) {
+    mtext(metrics_text, side = 1, line = 0.5, cex = 0.9, col = "darkred", font = 2)
+  }
+  
+  invisible(g_clean)
+}
+
+# be able to select specific graphs and compare them
+
+dag_and_image <- function(seed_t = 75, p_t = 30, deg_t = 3, alpha_t = 0.01) {
+  
+  # subset to specific parameters
+  dag_dat <- final_dag_database %>%
+    filter(seed == seed_t & p == p_t  & alpha == alpha_t & deg == deg_t)
+  
+  # pull metrics to annotate graph
+  metrics <- subset(results, seed == seed_t & alpha == alpha_t & p == p_t & deg == deg_t)
+  
+  dag_dat$metrics_str <- NA
+  dag_dat$method_title <- NA
+  
+  # loop thru methods
+  for (i in 1:nrow(dag_dat)) {
+    current_method <- dag_dat$method[i]
+    metrics_subset <- subset(metrics, method == current_method)
+    
+    if(nrow(metrics_subset) > 0) {
+      dag_dat$metrics_str[i] <- paste0("TPR: ", round(metrics_subset$TPR, 2), 
+                                       " | FPR: ", round(metrics_subset$FPR, 2), 
+                                       " | SHD: ", metrics_subset$SHD)
+      
+
+      dag_dat$method_title[i] <-  metrics_subset$method_named
+    }
+  }
+  
+
+  # make a png with parameters
+  file_name <- paste0("plots/dags_", seed_t, "_", p_t, "_",  alpha_t, "_", deg_t, "_", gsub("-", "_", Sys.Date()), ".png")
+  png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+  
+
+  par(mfrow = c(3, 3), mar = c(4, 1, 2, 1))
+  plot_clean_dag(dag_dat$true_dag[[1]], "True DAG", node_color = "lightblue")
+  
+  for (i in 1:nrow(dag_dat)) {
+    plot_clean_dag(adj_matrix = dag_dat$est_dag[[i]], 
+                   plot_title = dag_dat$method_title[i], 
+                   metrics_text = dag_dat$metrics_str[i], 
+                   node_color = "lightgreen")
+  }
+  
+  # Close and save
+  dev.off()
+}
+
+```
+
+```{r}
+indiviudal_plot <- function(mean_var, sd_var, label){
+plot <- filtered_dat %>%  ggplot(aes(
+    x = factor(p),
+    y = .data[[mean_var]],
+    group = method_named,
+    color = method_named)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = .data[[mean_var]] - .data[[sd_var]], ymax = .data[[mean_var]] + .data[[sd_var]]), 
+                width = 0.05, size = 0.7) +
+  geom_line(size = 1) +
+  xlab("Number of Variables") +
+  ylab(paste(label)) +
+  guides(color=guide_legend(title="Method")) +
+  theme_bw()
+return(plot)
+}
+
+plots <- list()
+group_tables <- list()
+tbls <- list()
+
+for (i in unique(results_summary$alpha)){
+  for (j in unique(results_summary$deg)){
+
+filtered_dat <- results_summary %>% filter(alpha == i & deg == j)
+
+time_plot <- indiviudal_plot("mean_time_secs","sd_time_secs", "Time (seconds)")
+TPR_plot <- indiviudal_plot("mean_TPR","sd_TPR", "TPR")
+FPR_plot <- indiviudal_plot("mean_FPR","sd_FPR", "FPR")
+adj_prec_plot <- indiviudal_plot("mean_adj_prec","sd_adj_prec", "Adjacency Precision")
+adj_rec_plot <- indiviudal_plot("mean_adj_rec","sd_adj_rec", "Adjacency Recall")
+arr_pre_plot <- indiviudal_plot("mean_arr_prec","sd_arr_prec", "Arrowhead Precision")
+arr_rec_plot <- indiviudal_plot("mean_arr_rec","sd_arr_rec", "Arrowhead Recall")
+SHD_plot <- indiviudal_plot("mean_SHD","sd_SHD", "SHD")
+
+plots[[paste0(i, "/", j)]] <- ggarrange(time_plot, TPR_plot, FPR_plot, SHD_plot,
+                                        adj_prec_plot,adj_rec_plot,
+                                        arr_pre_plot, arr_rec_plot,
+                                              common.legend = TRUE)
+
+
+pdf(file = paste0("plots/plots_no_6", i, "_", j, "_",  gsub("-", "_", Sys.Date()), ".pdf"), height = 8, width = 11)
+print(plots[[paste0(i, "/", j)]])
+dev.off()
+
+# 
+# ## Tables
+# filtered_dat <- results %>% filter(alpha == i & deg == j)
+# filtered_dat$method_named <- factor(
+#   filtered_dat$method_named #,
+#   # levels = c("Copula PC", "DAGSLAM","FGES (DG)", "Gaussian PC", "Latent PC", "Oracle PC")
+# )
+
+
+# for (k in unique(filtered_dat$p)){
+# tbls[[k]] <- filtered_dat %>%
+#   filter(p == k) %>%
+#   select(time_secs, TPR:method_named) %>%
+#  tbl_summary(by = method_named,
+#              label = list(time_secs ~ "Time (Seconds)",
+#                           adj_prec ~ "Adjacency Precision",
+#                           adj_rec ~ "Adjacency Recall",
+#                           arr_prec ~ "Arrowhead Precision",
+#                           arr_rec ~ "Arrowhead Recall"),
+#              statistic = list(all_continuous() ~ "{mean} ({sd})")) %>% 
+#   modify_table_body(~ .x %>%
+#      dplyr::mutate(stat_1 = if_else(stat_1 == "NA (NA)", "-", stat_1))) %>%
+#   modify_header(all_stat_cols() ~ "**{level}**")
+# }
+
+# group_tables[[paste0(i, "/", j)]] <- tbl_stack(
+#   tbls = tbls, group_header = c("30 variables", "50 variables", "100 variables"))
+  }
+}
+
+results %>%
+  select(time_secs, TPR:method_named) %>%
+ tbl_summary(by = method_named,
+             label = list(time_secs ~ "Time (Seconds)",
+                          adj_prec ~ "Adjacency Precision",
+                          adj_rec ~ "Adjacency Recall",
+                          arr_prec ~ "Arrowhead Precision",
+                          arr_rec ~ "Arrowhead Recall"),
+             statistic = list(all_continuous() ~ "{mean} ({sd})")) %>% 
+  modify_table_body(~ .x %>%
+     dplyr::mutate(stat_1 = if_else(stat_1 == "NA (NA)", "-", stat_1))) %>%
+  modify_header(all_stat_cols() ~ "**{level}**")
+```
+
+## ROC Curves :)
+
+```{r}
+# Function to generate ROC or Precision-Recall curves
+plot_performance_curve <- function(summary_data, metric_x, metric_y, plot_title, x_label, y_label) {
+  
+  summary_data$`Variables` <- summary_data$p
+  summary_data$`Sparsity` <- summary_data$deg
+  
+  summary_data %>%
+    ggplot(aes(
+      x = .data[[metric_x]], 
+      y = .data[[metric_y]], 
+      color = method_named,             # Color = Algorithm
+      shape = as.factor(alpha)          # Shape = Alpha (3 distinct shapes)
+    )) +
+    # Just the dots! Slightly larger and slightly transparent to see overlaps
+    geom_point(size = 3.5, alpha = 0.7) +
+    # This creates a grid: Rows are Degrees, Columns are Variables (p)
+    facet_grid(`Sparsity` ~ `Variables`, labeller = label_both) +
+    labs(
+      title = plot_title,
+      x = x_label,
+      y = y_label,
+      color = "Method",
+      shape = expression(alpha~"Level")
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold"),
+      # Makes the facet labels look sharp
+      strip.background = element_rect(fill = "grey90"), 
+      strip.text = element_text(face = "bold")
+    ) +
+    # Lock axes from 0 to 1 for standard metric comparison
+    scale_x_continuous(limits = c(0, 1)) +
+    scale_y_continuous(limits = c(0, 1))
+}
+
+indiviudal_boxplot <- function(var){
+plot <- filtered_dat %>%  ggplot(aes(
+    x = factor(p),
+    y = .data[[var]],
+    color = method_named,
+    group = interaction(p, method_named))) +
+  geom_boxplot() +
+  xlab("Number of Variables") + 
+  guides(color=guide_legend(title="Method")) +
+  theme_bw()
+return(plot)
+}
+```
+
+```{r}
+
+roc_plot <- plot_performance_curve(
+  summary_data = results_summary,
+  metric_x = "mean_FPR", 
+  metric_y = "mean_TPR", 
+  plot_title = "True Positive vs False Positive Rate",
+  x_label = "False Positive Rate (FPR)",
+  y_label = "True Positive Rate (TPR)"
+)
+
+edge_roc_plot <- plot_performance_curve(
+  summary_data = results_summary,
+  metric_x = "mean_adj_rec", 
+  metric_y = "mean_adj_prec", 
+  plot_title = "Adjacency Precision vs Recall",
+  x_label = "Edge Recall",
+  y_label = "Edge Precision"
+)
+
+dir_roc_plot <- plot_performance_curve(
+  summary_data = results_summary,
+  metric_x = "mean_arr_rec", 
+  metric_y = "mean_arr_prec", 
+  plot_title = "Arrowhead Precision vs Recall",
+  x_label = "Arrowhead Recall",
+  y_label = "Arrowhead Precision"
+)
+
+file_name <- paste0("plots/roc_curve_TPR_", gsub("-", "_", Sys.Date()), ".png")
+png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+print(roc_plot)
+dev.off()
+
+file_name <- paste0("plots/roc_curve_adj_", gsub("-", "_", Sys.Date()), ".png")
+png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+print(edge_roc_plot)
+dev.off()
+
+file_name <- paste0("plots/roc_curve_arr_", gsub("-", "_", Sys.Date()), ".png")
+png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+print(dir_roc_plot)
+dev.off()
+
+results_time_shd <- results %>%
+  group_by(method, p) %>%
+  summarize(
+    # Time metrics
+    median_time_secs = median(time_secs, na.rm = TRUE),
+    time_q25 = quantile(time_secs, 0.25, na.rm = TRUE),
+    time_q75 = quantile(time_secs, 0.75, na.rm = TRUE),
+    
+    # SHD metrics
+    median_SHD = median(SHD, na.rm = TRUE),
+    SHD_q25 = quantile(SHD, 0.25, na.rm = TRUE),
+    SHD_q75 = quantile(SHD, 0.75, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(method_named = factor(case_when(
+    method == 1 ~ "Oracle PC",
+    method == 2 ~ "Gaussian PC",
+    method == 3 ~ "FGES (DG)",
+    method == 4 ~ "Copula PC",
+    method == 5 ~ "Latent PC",
+    method == 6 ~ "DAGSLAM"
+  )), p = as.factor(p))
+
+
+SHD_plot <- ggplot(results_time_shd, aes(
+    x = as.factor(p), 
+    y = median_SHD, 
+    color = method_named, 
+    group = method_named
+  )) +
+  # 1. Draw the connecting lines
+  geom_line(linewidth = 1, position = position_dodge(0.4), alpha = 0.7) +
+  
+  # 2. Add the IQR Error Bars!
+  geom_errorbar(
+    aes(ymin = SHD_q25, ymax = SHD_q75), 
+    width = 0.15, 
+    linewidth = 0.8,
+    position = position_dodge(0.4), # Must match the line dodge exactly
+    alpha = 0.8
+  ) +
+  
+  # 3. Add the shrunk points (Size 2 instead of 3.5)
+  geom_point(size = 2, position = position_dodge(0.4)) +
+  
+  labs(
+    title = "Structural Hamming Distance (SHD)",
+    x = "Number of Variables (p)",
+    y = "SHD",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+
+
+# SHD_plot
+
+time_plot <- ggplot(results_time_shd, aes(
+    x = as.factor(p), 
+    y = median_time_secs, 
+    color = method_named, 
+    group = method_named
+  )) +
+  geom_line(linewidth = 1, position = position_dodge(0.4), alpha = 0.7) +
+    geom_errorbar(
+    aes(ymin = time_q25, ymax = time_q75), 
+    width = 0.15, 
+    linewidth = 0.8,
+    position = position_dodge(0.4), # Must match the line dodge exactly
+    alpha = 0.8
+  ) +
+  geom_point(size = 2, position = position_dodge(0.4)) +
+  scale_y_log10(
+    breaks = scales::trans_breaks("log10", function(x) 10^x)
+  ) +
+  labs(
+    title = "Computational Time",
+    x = "Number of Variables (p)",
+    y = "Log Computational Time (Seconds)",
+    color = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12, face = "bold")
+  ) 
+
+
+file_name <- paste0("plots/time_plot_", gsub("-", "_", Sys.Date()), ".png")
+png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+print(time_plot)
+dev.off()
+
+file_name <- paste0("plots/SHD_plot_", gsub("-", "_", Sys.Date()), ".png")
+png(file = file_name, height = 8, width = 11, units = "in", res = 500)
+print(SHD_plot)
+dev.off()
+```
+
+```{r}
+library(gt)
+
+# formatting the table values
+format_best <- function(mean_val, sd_val, method_col, direction, decimals = 2) {
+  rounded_means <- round(mean_val, decimals)
+  
+  # ignore oracle for best values
+  valid_means <- rounded_means[method_col != "Oracle PC"]
+  best_val <- if (direction == "max") max(valid_means, na.rm = TRUE) else min(valid_means, na.rm = TRUE)
+  
+  fmt <- paste0("%.", decimals, "f (%.", decimals, "f)")
+  fmt_bold <- paste0("**", fmt, "**")
+  is_best <- (method_col != "Oracle PC") & (rounded_means == best_val)
+  
+  # apply formatting
+  ifelse(is_best, 
+         sprintf(fmt_bold, mean_val, sd_val), 
+         sprintf(fmt, mean_val, sd_val))
+}
+
+# filter data
+table_data <- results %>%
+  filter(alpha == 0.001, deg == 3) %>%
+  mutate(method_named = factor(method_named, 
+         levels = c("Oracle PC", "Gaussian PC", "Copula PC", "Latent PC", "FGES (DG)", "DAGSLAM"))) %>%
+  group_by(p, method_named) %>%
+  summarise(
+    across(
+      .cols = c(time_secs, SHD, TPR, FPR, adj_prec, adj_rec, arr_prec, arr_rec),
+      .fns = list(
+        mean = ~mean(., na.rm = TRUE),
+        sd   = ~sd(., na.rm = TRUE)
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(p, method_named)
+
+
+
+# 2. Your massively simplified data pipeline
+formatted_data <- table_data %>%
+  group_by(p) %>%
+  mutate(
+    `Time (Seconds)` = format_best(time_secs_mean, time_secs_sd, method_named, "min", 1),
+    SHD              = format_best(SHD_mean,       SHD_sd,       method_named, "min", 1),
+    FPR              = format_best(FPR_mean,       FPR_sd,       method_named, "min", 2),
+    TPR              = format_best(TPR_mean,       TPR_sd,       method_named, "max", 2),
+    `Adj Prec`       = format_best(adj_prec_mean,  adj_prec_sd,  method_named, "max", 2),
+    `Adj Rec`        = format_best(adj_rec_mean,   adj_rec_sd,   method_named, "max", 2),
+    `Arr Prec`       = format_best(arr_prec_mean,  arr_prec_sd,  method_named, "max", 2),
+    `Arr Rec`        = format_best(arr_rec_mean,   arr_rec_sd,   method_named, "max", 2),
+    Scenario = paste(p, "Variables")
+  ) %>%
+  ungroup() %>%
+  select(Scenario, Method = method_named, `Time (Seconds)`, SHD, TPR, FPR, 
+         `Adj Prec`, `Adj Rec`, `Arr Prec`, `Arr Rec`)
+
+final_table <- formatted_data %>%
+  gt(groupname_col = "Scenario") %>%
+  tab_header(
+    title = "Simulation Results for Parameters [Alpha = 0.001, FGES penalty = 4, DGES penalty = 0.1], Sparsity = 3",
+    subtitle = "Averaged over 100 replicates (Mean (SD))"
+  ) %>%
+  tab_spanner(
+    label = "Overall Performance",
+    columns = c(SHD, TPR, FPR)
+  ) %>%
+  tab_spanner(
+    label = "Skeleton",
+    columns = c(`Adj Prec`, `Adj Rec`)
+  ) %>%
+  tab_spanner(
+    label = "Directed",
+    columns = c(`Arr Prec`, `Arr Rec`)
+  ) %>%
+  # TELL GT TO RENDER THE MARKDOWN STARS AS BOLD TEXT
+  fmt_markdown(
+    columns = c(`Time (Seconds)`, SHD, TPR, FPR, `Adj Prec`, `Adj Rec`, `Arr Prec`, `Arr Rec`)
+  ) %>%
+  cols_align(align = "center", columns = -Method) %>%
+  cols_align(align = "left", columns = Method) %>%
+  tab_options(
+    row_group.font.weight = "bold",
+    row_group.background.color = "grey95",
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    heading.title.font.weight = "bold"
+  )
+
+# Print it!
+final_table
+```
